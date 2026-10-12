@@ -1,0 +1,30 @@
+
+# Environment variables and secrets
+.env
+.env.*
+
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Test cache
+.pytest_cache/
+
+# Local database
+emails.db
+test_emails.db
+*.db-journal
+
+# Application logs
+logs/
+*.log
+
+# IDE files
+.vscode/
+.idea/
+
+recipients.csv
