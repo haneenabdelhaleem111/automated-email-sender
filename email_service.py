@@ -17,7 +17,11 @@ def send_email(receiver_email, subject, body, max_retries=3):
     if not SENDER_EMAIL or not SENDER_PASSWORD:
         raise RuntimeError("Email credentials are not configured.")
 
-    if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 1:
+    if (
+        not isinstance(max_retries, int)
+        or isinstance(max_retries, bool)
+        or max_retries < 1
+    ):
         raise ValueError("max_retries must be a positive integer.")
 
     message = EmailMessage()
@@ -45,7 +49,8 @@ def send_email(receiver_email, subject, body, max_retries=3):
             logger.info("Email sent successfully to %s", receiver_email)
             return
 
-        except (smtplib.SMTPAuthenticationError, smtplib.SMTPRecipientsRefused):
+        except (smtplib.SMTPAuthenticationError,
+                smtplib.SMTPRecipientsRefused):
             logger.exception(
                 "Permanent email error for %s; retry will not be attempted",
                 receiver_email,
@@ -53,8 +58,6 @@ def send_email(receiver_email, subject, body, max_retries=3):
             raise
 
         except smtplib.SMTPResponseException as error:
-            # SMTP 4xx responses are generally temporary;
-            # SMTP 5xx responses are generally permanent.
             if not 400 <= error.smtp_code < 500:
                 logger.exception(
                     "Permanent SMTP response %s for %s",
@@ -92,3 +95,33 @@ def send_email(receiver_email, subject, body, max_retries=3):
         )
 
         time.sleep(delay)
+
+
+def send_bulk_emails(recipient_emails, subject, body):
+    results = []
+
+    for recipient_email in recipient_emails:
+        try:
+            send_email(
+                receiver_email=str(recipient_email),
+                subject=subject,
+                body=body,
+            )
+            results.append({
+                "recipient_email": str(recipient_email),
+                "status": "sent",
+                "error": None,
+            })
+
+        except Exception as error:
+            logger.exception(
+                "Bulk email sending failed for %s",
+                recipient_email,
+            )
+            results.append({
+                "recipient_email": str(recipient_email),
+                "status": "failed",
+                "error": str(error),
+            })
+
+    return results

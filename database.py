@@ -31,6 +31,17 @@ def get_connection(database_name=None):
 def initialize_database(database_name=None):
     with database_connection(database_name) as connection:
         connection.execute("""
+            CREATE TABLE IF NOT EXISTS email_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                idempotency_key TEXT UNIQUE
+            )
+        """)
+
+        connection.execute("""
             CREATE TABLE IF NOT EXISTS emails (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 recipient_email TEXT NOT NULL,
@@ -43,7 +54,6 @@ def initialize_database(database_name=None):
             )
         """)
 
-        # Add the column if the database already existed
         columns = {
             row["name"]
             for row in connection.execute(
@@ -57,12 +67,61 @@ def initialize_database(database_name=None):
                 ADD COLUMN idempotency_key TEXT
             """)
 
-        # Non-null keys must be unique; multiple NULL values are allowed
+        if "batch_id" not in columns:
+            connection.execute("""
+                ALTER TABLE emails
+                ADD COLUMN batch_id INTEGER
+                REFERENCES email_batches(id)
+            """)
+
         connection.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS
             idx_emails_idempotency_key
             ON emails(idempotency_key)
         """)
+
+
+def create_email_batch(
+    subject,
+    body,
+    database_name=None,
+    idempotency_key=None,
+):
+    with database_connection(database_name) as connection:
+        cursor = connection.execute("""
+            INSERT INTO email_batches (
+                subject,
+                body,
+                idempotency_key
+            )
+            VALUES (?, ?, ?)
+        """, (subject, body, idempotency_key))
+
+        return cursor.lastrowid
+
+
+def get_email_batch_by_idempotency_key(
+    idempotency_key,
+    database_name=None,
+):
+    with database_connection(database_name) as connection:
+        row = connection.execute("""
+            SELECT id, subject, body, status, created_at,
+                   idempotency_key
+            FROM email_batches
+            WHERE idempotency_key = ?
+        """, (idempotency_key,)).fetchone()
+
+        return dict(row) if row else None
+
+
+def update_email_batch_status(batch_id, status, database_name=None):
+    with database_connection(database_name) as connection:
+        connection.execute("""
+            UPDATE email_batches
+            SET status = ?
+            WHERE id = ?
+        """, (status, batch_id))
 
 
 def save_email(
@@ -71,6 +130,7 @@ def save_email(
     body,
     database_name=None,
     idempotency_key=None,
+    batch_id=None,
 ):
     with database_connection(database_name) as connection:
         cursor = connection.execute("""
@@ -78,14 +138,16 @@ def save_email(
                 recipient_email,
                 subject,
                 body,
-                idempotency_key
+                idempotency_key,
+                batch_id
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
         """, (
             recipient_email,
             subject,
             body,
             idempotency_key,
+            batch_id,
         ))
 
         return cursor.lastrowid
@@ -98,12 +160,27 @@ def get_email_by_idempotency_key(
     with database_connection(database_name) as connection:
         row = connection.execute("""
             SELECT id, recipient_email, subject, body,
-                   status, created_at, sent_at, idempotency_key
+                   status, created_at, sent_at,
+                   idempotency_key, batch_id
             FROM emails
             WHERE idempotency_key = ?
         """, (idempotency_key,)).fetchone()
 
         return dict(row) if row else None
+
+
+def get_emails_by_batch_id(batch_id, database_name=None):
+    with database_connection(database_name) as connection:
+        rows = connection.execute("""
+            SELECT id, recipient_email, subject, body,
+                   status, created_at, sent_at,
+                   idempotency_key, batch_id
+            FROM emails
+            WHERE batch_id = ?
+            ORDER BY id
+        """, (batch_id,)).fetchall()
+
+        return [dict(row) for row in rows]
 
 
 def update_email_status(email_id, status, database_name=None):
@@ -126,9 +203,58 @@ def get_all_emails(database_name=None):
     with database_connection(database_name) as connection:
         rows = connection.execute("""
             SELECT id, recipient_email, subject, body,
-                   status, created_at, sent_at, idempotency_key
+                   status, created_at, sent_at,
+                   idempotency_key, batch_id
             FROM emails
             ORDER BY id DESC
         """).fetchall()
 
         return [dict(row) for row in rows]
+
+
+
+def save_email_batch(
+    subject,
+    body,
+    recipient_emails,
+    database_name=None,
+    idempotency_key=None,
+):
+    with database_connection(database_name) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO email_batches (
+                subject,
+                body,
+                idempotency_key
+            )
+            VALUES (?, ?, ?)
+            """,
+            (subject, body, idempotency_key),
+        )
+
+        batch_id = cursor.lastrowid
+        email_ids = []
+
+        for recipient_email in recipient_emails:
+            cursor = connection.execute(
+                """
+                INSERT INTO emails (
+                    recipient_email,
+                    subject,
+                    body,
+                    batch_id
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    recipient_email,
+                    subject,
+                    body,
+                    batch_id,
+                ),
+            )
+
+            email_ids.append(cursor.lastrowid)
+
+        return batch_id, email_ids
