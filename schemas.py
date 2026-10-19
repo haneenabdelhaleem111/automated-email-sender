@@ -10,7 +10,8 @@
 #     body: str = Field(min_length=1, max_length=10000)
 
 from pydantic import BaseModel, EmailStr, Field, ConfigDict, model_validator
-
+from datetime import datetime
+from pydantic import field_validator
 
 class EmailRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -48,3 +49,25 @@ class EmailRequest(BaseModel):
                 )
 
         return self
+
+
+from datetime import datetime
+from pydantic import field_validator
+
+
+class ScheduledEmailRequest(EmailRequest):
+    scheduled_at: datetime
+    timezone: str = Field(
+        default="Africa/Cairo",
+        min_length=1,
+        max_length=64,
+    )
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_scheduled_at_timezone(cls, value):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "scheduled_at must include timezone information."
+            )
+        return value

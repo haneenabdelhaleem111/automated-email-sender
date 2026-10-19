@@ -4,13 +4,16 @@ import database
 import smtplib
 import sqlite3
 
+from flask_cors import CORS
 from flask import Flask, jsonify, request
 from validation import validate_email
 from email_service import send_email, send_bulk_emails
 from pydantic import ValidationError
-from schemas import EmailRequest
+from schemas import EmailRequest, ScheduledEmailRequest
 from logger_config import logger
 from flasgger import Swagger
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from database import (
     initialize_database,
@@ -26,10 +29,23 @@ from database import (
 )
 
 app = Flask(__name__)
+
+CORS(
+    app,
+    resources={r"/*": {"origins": [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]}},
+    supports_credentials=True,
+    allow_headers=["Content-Type", "Idempotency-Key"],
+    methods=["GET", "POST", "OPTIONS"],
+)
+
+
+
 app.config["DATABASE"] = database.DATABASE_NAME
 swagger = Swagger(app)
 database.initialize_database(app.config["DATABASE"])
-
 
 @app.route("/", methods=["GET"])
 def home():
@@ -627,6 +643,262 @@ def create_email():
         "recipient_email": recipient_email,
         "duplicate": False,
     }), 200
+
+
+@app.route("/api/emails/schedule", methods=["POST"])
+def schedule_email():
+    """Save an email or bulk email batch for future delivery."""
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "error": "Request body must be a JSON object",
+        }), 400
+
+    try:
+        email_data = ScheduledEmailRequest.model_validate(data)
+    except ValidationError as error:
+        return jsonify({
+            "error": "Invalid scheduled email data",
+            "details": error.errors(
+                include_url=False,
+                include_input=False,
+                include_context=False,
+            ),
+        }), 400
+
+    # Validate the requested IANA timezone.
+    try:
+        ZoneInfo(email_data.timezone)
+    except (ValueError, TypeError, KeyError):
+        return jsonify({
+            "error": "Invalid timezone",
+        }), 400
+    except Exception as error:
+        from zoneinfo import ZoneInfoNotFoundError
+
+        if isinstance(error, ZoneInfoNotFoundError):
+            return jsonify({
+                "error": "Unknown timezone",
+            }), 400
+        raise
+
+    requested_time = email_data.scheduled_at
+    now = datetime.now(timezone.utc)
+
+    if requested_time <= now:
+        return jsonify({
+            "error": "scheduled_at must be in the future",
+        }), 400
+
+    # Store timestamps consistently in UTC with millisecond precision.
+    scheduled_at = requested_time.astimezone(
+        timezone.utc
+    ).isoformat(timespec="milliseconds")
+
+    recipient_email = (
+        str(email_data.recipient_email).strip()
+        if email_data.recipient_email is not None
+        else None
+    )
+
+    recipient_emails = (
+        [str(email).strip() for email in email_data.recipient_emails]
+        if email_data.recipient_emails
+        else None
+    )
+
+    subject = email_data.subject.strip()
+    body = email_data.body.strip()
+
+    if not subject or not body:
+        return jsonify({
+            "error": "Subject and body are required",
+        }), 400
+
+    recipients = recipient_emails or [recipient_email]
+
+    invalid_emails = [
+        email for email in recipients
+        if not email or not validate_email(email)
+    ]
+
+    if invalid_emails:
+        return jsonify({
+            "error": "One or more email addresses are invalid",
+            "invalid_emails": invalid_emails,
+        }), 400
+
+    idempotency_key = request.headers.get("Idempotency-Key")
+
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+
+        if not idempotency_key or len(idempotency_key) > 200:
+            return jsonify({
+                "error": "Idempotency-Key must contain 1-200 characters",
+            }), 400
+
+    database_name = app.config["DATABASE"]
+
+    # Bulk scheduling.
+    if recipient_emails:
+        existing_batch = None
+
+        if idempotency_key:
+            existing_batch = get_email_batch_by_idempotency_key(
+                idempotency_key,
+                database_name=database_name,
+            )
+
+        if existing_batch is not None:
+            existing_emails = get_emails_by_batch_id(
+                existing_batch["id"],
+                database_name=database_name,
+            )
+
+            same_recipients = [
+                email["recipient_email"].casefold()
+                for email in existing_emails
+            ] == [
+                email.casefold()
+                for email in recipient_emails
+            ]
+
+            same_schedule = (
+                len(existing_emails) == len(recipient_emails)
+                and all(
+                    email["scheduled_at"] == scheduled_at
+                    for email in existing_emails
+                )
+            )
+
+            same_payload = (
+                existing_batch["subject"] == subject
+                and existing_batch["body"] == body
+                and same_recipients
+                and same_schedule
+            )
+
+            if not same_payload:
+                return jsonify({
+                    "error": (
+                        "Idempotency-Key was already used "
+                        "with different data or schedule"
+                    ),
+                }), 409
+
+            return jsonify({
+                "message": "This batch was already scheduled",
+                "status": existing_batch["status"],
+                "batch_id": existing_batch["id"],
+                "duplicate": True,
+            }), 200
+
+        try:
+            batch_id, email_ids = save_email_batch(
+                subject=subject,
+                body=body,
+                recipient_emails=recipient_emails,
+                database_name=database_name,
+                idempotency_key=idempotency_key,
+                scheduled_at=scheduled_at,
+            )
+        except sqlite3.IntegrityError:
+            logger.exception("Duplicate bulk scheduling request")
+            return jsonify({
+                "error": (
+                    "This scheduling request already exists. "
+                    "Check its status before retrying."
+                ),
+            }), 409
+        except Exception:
+            logger.exception("Could not save scheduled email batch")
+            return jsonify({
+                "error": "Could not save the scheduled email batch",
+            }), 500
+
+        return jsonify({
+            "message": "Email batch scheduled successfully",
+            "status": "scheduled",
+            "batch_id": batch_id,
+            "email_ids": email_ids,
+            "scheduled_at": scheduled_at,
+            "timezone": email_data.timezone,
+            "duplicate": False,
+        }), 201
+
+    # Single-email scheduling.
+    if idempotency_key:
+        existing_email = get_email_by_idempotency_key(
+            idempotency_key,
+            database_name=database_name,
+        )
+
+        if existing_email is not None:
+            same_payload = (
+                existing_email["recipient_email"].casefold()
+                == recipient_email.casefold()
+                and existing_email["subject"] == subject
+                and existing_email["body"] == body
+                and existing_email["scheduled_at"] == scheduled_at
+            )
+
+            if not same_payload:
+                return jsonify({
+                    "error": (
+                        "Idempotency-Key was already used "
+                        "with different data or schedule"
+                    ),
+                }), 409
+
+            return jsonify({
+                "message": "This email was already scheduled",
+                "status": existing_email["status"],
+                "email_id": existing_email["id"],
+                "scheduled_at": existing_email["scheduled_at"],
+                "duplicate": True,
+            }), 200
+
+    try:
+        email_id = save_email(
+            recipient_email=recipient_email,
+            subject=subject,
+            body=body,
+            database_name=database_name,
+            idempotency_key=idempotency_key,
+            scheduled_at=scheduled_at,
+        )
+    except sqlite3.IntegrityError:
+        logger.exception("Duplicate scheduled email request")
+        return jsonify({
+            "error": (
+                "This scheduling request already exists. "
+                "Check its status before retrying."
+            ),
+        }), 409
+    except Exception:
+        logger.exception("Could not save scheduled email")
+        return jsonify({
+            "error": "Could not save the scheduled email",
+        }), 500
+
+    logger.info(
+        "Email scheduled. Email ID: %s, scheduled_at: %s",
+        email_id,
+        scheduled_at,
+    )
+
+    return jsonify({
+        "message": "Email scheduled successfully",
+        "status": "scheduled",
+        "email_id": email_id,
+        "recipient_email": recipient_email,
+        "scheduled_at": scheduled_at,
+        "timezone": email_data.timezone,
+        "duplicate": False,
+    }), 201
 
 
 @app.route("/api/emails", methods=["GET"])
